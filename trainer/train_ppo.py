@@ -80,7 +80,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
 
     rewards = torch.zeros(len(responses), device=args.device)
 
-    # 格式奖励
+    # 手动打分
     if args.reasoning == 1:
         rewards = reasoning_model_reward(rewards)
 
@@ -141,7 +141,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
 
         # 标记真token的位置为1，参与attention计算
         full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
-        # 对整条序列的“最终状态”给一个 value
+        # 对整条序列的“最终状态”（模型的最后一层hidden_state）给一个 value
         values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]
 
         # 取“最后一个有效 token”的 value 当作整条 response 的 baseline 估计

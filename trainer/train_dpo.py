@@ -30,8 +30,7 @@ def logits_to_log_probs(logits, labels):
     return log_probs_per_token
 
 
-def 
-(ref_log_probs, policy_log_probs, mask, beta):
+def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
     # https://github.com/jingyaogong/minimind/issues/298
     seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 防止零长度mask导致除零NaN

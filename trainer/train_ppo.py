@@ -149,13 +149,14 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B] 每一行最后一个非padding位置的value
         advantages = rewards - values.detach()  # [B]
 
+        # 计算每个 token 在当前策略下的概率
         with autocast_ctx:
             res = actor_model(input_ids=gen_out, attention_mask=full_mask)
             logits = res.logits  # [B, P+R+pad, V]
             aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
         
         labels = gen_out[:, 1:].clone()  # [B, P+R+pad-1]
-        # 取对应生成token的log概率（在大小为V的词表中找到label标签对应的token即需要生成的token）
+        # [采样结果当输入]取对应生成token的log概率（在大小为V的词表中找到label标签对应的token即需要生成的token）
         logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R+pad-1]
         seq_len = gen_out.size(1) - 1
         # [prompt=0 | response,pad=1]

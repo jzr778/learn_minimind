@@ -106,10 +106,14 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
             model_for_gen = model.module if isinstance(model, DistributedDataParallel) else model
             outputs = model_for_gen.generate(
                 **prompt_inputs, max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
-                num_return_sequences=args.num_generations, pad_token_id=tokenizer.pad_token_id)  # [B*num_gen, P+R]
+                num_return_sequences=args.num_generations, pad_token_id=tokenizer.pad_token_id)  # [B*num_gen, P+R+pad]
+            # 同一个 prompt 采样 num_generations 个样本
+            # R 是生成 token 长度（不等长但会 pad 到同长度）
 
-        completion_ids = outputs[:, prompt_inputs["input_ids"].size(1):]  # [B*num_gen, R]
+        # 切出生成的部分：prompt_inputs["input_ids"].size(1)就是长度P
+        completion_ids = outputs[:, prompt_inputs["input_ids"].size(1):]  # [B*num_gen, R+pad]
         
+        # 模型对输入给真实 token 的概率 [B*num_gen, R]
         def get_per_token_logps(mdl, input_ids, n_keep):
             input_ids = input_ids.detach().clone() if input_ids.is_inference() else input_ids
             logits = mdl(input_ids, logits_to_keep=n_keep + 1).logits[:, :-1, :]
@@ -119,23 +123,28 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
                 per_token_logps.append(torch.gather(logits_row.log_softmax(dim=-1), 1, ids_row.unsqueeze(1)).squeeze(1))
             return torch.stack(per_token_logps)
 
+        # 当前模型 πθ 的 token log-prob
         with autocast_ctx:
             per_token_logps = get_per_token_logps(model, outputs, completion_ids.size(1))  # [B*num_gen, R]
             res = model(outputs) if lm_config.use_moe else None
             aux_loss = res.aux_loss if res is not None else torch.tensor(0.0, device=args.device)
         
+        # 计算 reference 模型的 per-token logp（冻结）
         with torch.no_grad():
             ref_per_token_logps = get_per_token_logps(ref_model, outputs, completion_ids.size(1))  # [B*num_gen, R]
 
+        # decode 得到文本回答（给 reward model 打分）
         completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
         rewards = calculate_rewards(prompts, completions, reward_model, reward_tokenizer).to(args.device)  # [B*num_gen]
 
+        # 组内标准化 advantage（GRPO 的精髓：不用 critic）
         grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
-        mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
-        std_r = grouped_rewards.std(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
+        mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B]广播->[B*num_gen]
+        std_r = grouped_rewards.std(dim=1).repeat_interleave(args.num_generations)  # [B]广播->[B*num_gen]
         advantages = torch.clamp((rewards - mean_r) / (std_r + 1e-4), -10, 10)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # [B*num_gen]
 
+        # mask 掉 eos 后面的 padding token
         is_eos = completion_ids == tokenizer.eos_token_id  # [B*num_gen, R]
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=args.device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
